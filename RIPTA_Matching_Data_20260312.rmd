@@ -1,0 +1,668 @@
+---
+title: "RIPTA Data Merge - Clean Pipeline"
+author: "Zhiqian He"
+date: "2026-03-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r libraries}
+library(data.table)
+library(sf)
+library(ggplot2)
+```
+
+# Paths and helpers
+
+```{r config}
+# -----------------------------
+# Input files
+# -----------------------------
+ridership_file <- "/Users/erica/Desktop/RIPTA/data/Ridership Data/april24_preprocessed.csv"
+system_file    <- "/Users/erica/Desktop/RIPTA/code/2026.03.10 Merge monthly data/AVLOTP2024.csv"
+stops_file     <- "/Users/erica/Desktop/RIPTA/code/2026.03.10 Merge monthly data/stops_RIPTA-GTFS_20240112.txt"
+
+# -----------------------------
+# Output folder
+# -----------------------------
+output_dir <- "/Users/erica/Desktop/RIPTA/code/2026.03.10 Merge monthly data"
+
+# -----------------------------
+# Main outputs to keep
+# -----------------------------
+mapped_avl_file      <- file.path(output_dir, "sys_apr_mapped_with_gtfs20240112.csv")
+daily_match_file     <- file.path(output_dir, "matched_trips_april_all_routes_daily.csv")
+monthly_bridge_file  <- file.path(output_dir, "matched_trips_april_monthly_bridge.csv")
+route_summary_file   <- file.path(output_dir, "route_otp_ridership_summary_april.csv")
+scatter_plot_file    <- file.path(output_dir, "otp_vs_weighted_otp_april.png")
+trip_rankings_file   <- file.path(output_dir, "trip_rankings_april.csv")
+
+# -----------------------------
+# Parameters
+# -----------------------------
+IOU_MIN <- 0.10
+TOLERANCE_SEC <- 120
+MAX_HEADWAY_SEC <- 1800
+KEEP_MAPPING_FLAGS <- c("good", "ok")
+BAD_APP_IDS <- c(0L, 99L, 999L, 9999L)
+OTP_THRESHOLD_MIN <- 5
+MIN_DAYS_FOR_RANKING <- 3
+
+# -----------------------------
+# Helper functions
+# -----------------------------
+seconds_of_day <- function(dt) {
+  as.integer(format(dt, "%H")) * 3600L +
+    as.integer(format(dt, "%M")) * 60L +
+    as.integer(format(dt, "%S"))
+}
+
+format_seconds <- function(x) {
+  x_int <- as.integer(round(x))
+  ifelse(
+    is.na(x_int), "",
+    sprintf("%02d:%02d:%02d",
+            x_int %/% 3600L,
+            (x_int %% 3600L) %/% 60L,
+            x_int %% 60L)
+  )
+}
+
+calculate_iou_containment <- function(start1, end1, start2, end2) {
+  overlap_start <- pmax(start1, start2)
+  overlap_end   <- pmin(end1, end2)
+  intersection  <- pmax(0, overlap_end - overlap_start)
+
+  duration1 <- pmax(0, end1 - start1)
+  duration2 <- pmax(0, end2 - start2)
+
+  union <- duration1 + duration2 - intersection
+  iou <- ifelse(union > 0, intersection / union, 0)
+
+  smaller_duration <- pmin(duration1, duration2)
+  containment <- ifelse(smaller_duration > 0, intersection / smaller_duration, 0)
+
+  list(iou = iou, containment = containment)
+}
+
+determine_confidence <- function(ratio_within_2min, iou, containment,
+                                 thresh_highly_conf = 0.8,
+                                 thresh_conf = 0.5,
+                                 thresh_contain = 0.9) {
+  if (!is.na(ratio_within_2min) && ratio_within_2min >= 0.5) {
+    return("Highly Confident (Stop-Validated)")
+  } else if (!is.na(iou) && iou >= thresh_highly_conf) {
+    return("Highly Confident")
+  } else if (!is.na(iou) && !is.na(containment) &&
+             iou >= thresh_conf && containment >= thresh_contain) {
+    return("Confident")
+  } else if (!is.na(iou) && iou >= thresh_conf) {
+    return("Confident")
+  } else {
+    return("Uncertain")
+  }
+}
+```
+
+# Step 1. Map AVL stops to GTFS stops
+
+```{r step1-map-avl}
+# Read source data
+rid <- fread(file = ridership_file)
+sys <- fread(file = system_file)
+stops <- fread(file = stops_file)
+
+# Rename key columns
+setnames(rid, old = c("Trip.Number", "Stop.Number"),
+         new = c("AppID", "app_stopID"), skip_absent = TRUE)
+setnames(sys, old = c("TripId"), new = c("SystemID"), skip_absent = TRUE)
+
+# Keep April only
+rid[, ServiceDate := as.Date(Time)]
+sys[, ServiceDate := as.Date(IncidentDateTime)]
+rid_apr <- rid[format(ServiceDate, "%Y-%m") == "2024-04"]
+sys_apr <- sys[format(ServiceDate, "%Y-%m") == "2024-04"]
+
+# GTFS lookup table
+stops_small <- stops[
+  !is.na(stop_lat) & !is.na(stop_lon),
+  c("stop_id", "stop_code", "stop_name", "stop_lat", "stop_lon"),
+  with = FALSE
+]
+
+# Unique AVL coordinates
+sys_pts <- unique(
+  sys_apr[
+    !is.na(BusStopLatitude) & !is.na(BusStopLongitude),
+    c("BusStopLatitude", "BusStopLongitude"),
+    with = FALSE
+  ]
+)
+
+# Spatial nearest-stop mapping
+sys_sf <- st_as_sf(sys_pts,
+                   coords = c("BusStopLongitude", "BusStopLatitude"),
+                   crs = 4326, remove = FALSE)
+stops_sf <- st_as_sf(stops_small,
+                     coords = c("stop_lon", "stop_lat"),
+                     crs = 4326, remove = FALSE)
+
+sys_sf_m <- st_transform(sys_sf, 3857)
+stops_sf_m <- st_transform(stops_sf, 3857)
+nearest_idx <- st_nearest_feature(sys_sf_m, stops_sf_m)
+nearest_stop <- stops_small[nearest_idx, ]
+dist_m <- as.numeric(st_distance(sys_sf_m, stops_sf_m[nearest_idx, ], by_element = TRUE))
+
+sys_map <- cbind(as.data.table(sys_pts), as.data.table(nearest_stop), dist_m = dist_m)
+sys_map[, mapping_flag := fifelse(
+  is.na(dist_m), "missing_coord",
+  fifelse(dist_m <= 50, "good",
+          fifelse(dist_m <= 200, "ok", "far"))
+)]
+
+# Merge mapped stop back to AVL
+sys_apr_mapped <- merge(
+  sys_apr,
+  sys_map,
+  by = c("BusStopLatitude", "BusStopLongitude"),
+  all.x = TRUE
+)
+setnames(sys_apr_mapped,
+         old = c("stop_id", "stop_code"),
+         new = c("Mapped_StopId", "Mapped_StopCode"),
+         skip_absent = TRUE)
+sys_apr_mapped[is.na(BusStopLatitude) | is.na(BusStopLongitude), mapping_flag := "missing_coord"]
+
+# Save main Step 1 output
+fwrite(sys_apr_mapped, file = mapped_avl_file)
+
+# Short validation summary
+cat("GTFS stop_id == stop_code:", unique(stops$stop_id == stops$stop_code), "\n")
+print(sys_apr_mapped[, .N, by = mapping_flag][order(mapping_flag)])
+cat("Saved mapped AVL file:\n", mapped_avl_file, "\n")
+
+# Cleanup objects not needed after Step 1
+rm(rid, sys, stops, rid_apr, sys_apr,
+   stops_small, sys_pts, sys_sf, stops_sf, sys_sf_m, stops_sf_m,
+   nearest_idx, nearest_stop, dist_m, sys_map)
+gc()
+```
+
+# Step 2. Daily matching between ridership and AVL
+
+```{r step2-daily-match}
+# Read ridership and mapped AVL
+rid_raw <- fread(file = ridership_file)
+sys_raw <- fread(file = mapped_avl_file)
+
+# Clean ridership
+setnames(rid_raw,
+         old = c("Trip.Number", "Stop.Number", "Route.Number", "Ride.Count", "Time"),
+         new = c("AppID", "app_stopID", "Route", "RideCount", "RideTime"),
+         skip_absent = TRUE)
+if (!"ServiceDate" %in% names(rid_raw)) rid_raw[, ServiceDate := as.Date(RideTime)]
+rid_raw[, RideTime := as.POSIXct(RideTime, tz = "America/New_York")]
+rid_raw[, Route := as.integer(Route)]
+rid_raw[, AppID := as.integer(AppID)]
+rid_raw[, app_stopID := as.integer(app_stopID)]
+rid_raw[, RideCount := as.numeric(RideCount)]
+rid_raw[, Seconds := seconds_of_day(RideTime)]
+
+rid_apr_clean <- rid_raw[
+  format(ServiceDate, "%Y-%m") == "2024-04" &
+    !is.na(AppID) &
+    !(AppID %in% BAD_APP_IDS),
+  c("ServiceDate", "Route", "AppID", "app_stopID", "RideTime", "Seconds", "RideCount"),
+  with = FALSE
+]
+
+# Clean mapped AVL
+setnames(sys_raw,
+         old = c("RouteId", "IncidentDateTime", "Deviation"),
+         new = c("Route", "SystemTime", "Deviation"),
+         skip_absent = TRUE)
+if (!"ServiceDate" %in% names(sys_raw)) sys_raw[, ServiceDate := as.Date(SystemTime)]
+sys_raw[, SystemTime := as.POSIXct(SystemTime, tz = "America/New_York")]
+sys_raw[, Route := as.integer(Route)]
+sys_raw[, SystemID := as.integer(SystemID)]
+sys_raw[, Mapped_StopId := as.integer(Mapped_StopId)]
+sys_raw[, Deviation := as.numeric(Deviation)]
+sys_raw[, Seconds := seconds_of_day(SystemTime)]
+
+sys_apr_clean <- sys_raw[
+  format(ServiceDate, "%Y-%m") == "2024-04" &
+    mapping_flag %in% KEEP_MAPPING_FLAGS &
+    !is.na(Mapped_StopId),
+  c("ServiceDate", "Route", "SystemID", "Mapped_StopId", "SystemTime",
+    "Seconds", "Deviation", "mapping_flag", "dist_m", "IncidentName"),
+  with = FALSE
+]
+
+# Build daily profiles
+app_profile_daily <- rid_apr_clean[
+  , .(
+    App_Start_Sec = min(Seconds, na.rm = TRUE),
+    App_End_Sec   = max(Seconds, na.rm = TRUE),
+    Number_of_Riders = sum(RideCount, na.rm = TRUE)
+  ),
+  by = .(Route, ServiceDate, AppID)
+]
+
+app_stop_profile_daily <- rid_apr_clean[
+  , .(App_StopTime_Median = median(Seconds, na.rm = TRUE)),
+  by = .(Route, ServiceDate, AppID, app_stopID)
+]
+
+sys_profile_daily <- sys_apr_clean[
+  , .(
+    Sys_Start_Sec = min(Seconds, na.rm = TRUE),
+    Sys_End_Sec   = max(Seconds, na.rm = TRUE)
+  ),
+  by = .(Route, ServiceDate, SystemID)
+]
+
+sys_stop_profile_daily <- sys_apr_clean[
+  , .(Sys_StopTime_Median = median(Seconds, na.rm = TRUE)),
+  by = .(Route, ServiceDate, SystemID, Mapped_StopId)
+]
+
+match_one_route_day <- function(route_val, date_val,
+                                app_profile_daily,
+                                sys_profile_daily,
+                                app_stop_profile_daily,
+                                sys_stop_profile_daily) {
+
+  app_r <- app_profile_daily[Route == route_val & ServiceDate == date_val]
+  sys_r <- sys_profile_daily[Route == route_val & ServiceDate == date_val]
+  if (nrow(app_r) == 0 || nrow(sys_r) == 0) return(NULL)
+
+  app_r[, join_key := 1L]
+  sys_r[, join_key := 1L]
+  cand <- merge(app_r, sys_r, by = "join_key", allow.cartesian = TRUE)
+  cand[, join_key := NULL]
+  if (nrow(cand) == 0) return(NULL)
+
+  if ("Route.x" %in% names(cand)) setnames(cand, "Route.x", "Route")
+  if ("Route.y" %in% names(cand)) cand[, Route.y := NULL]
+  if ("ServiceDate.x" %in% names(cand)) setnames(cand, "ServiceDate.x", "ServiceDate")
+  if ("ServiceDate.y" %in% names(cand)) cand[, ServiceDate.y := NULL]
+
+  m <- calculate_iou_containment(cand$Sys_Start_Sec, cand$Sys_End_Sec,
+                                 cand$App_Start_Sec, cand$App_End_Sec)
+  cand[, IoU := m$iou]
+  cand[, Containment := m$containment]
+  cand <- cand[IoU > IOU_MIN]
+  if (nrow(cand) == 0) return(NULL)
+
+  app_stops_r <- app_stop_profile_daily[Route == route_val & ServiceDate == date_val]
+  sys_stops_r <- sys_stop_profile_daily[Route == route_val & ServiceDate == date_val]
+
+  stop_eval <- NULL
+  if (nrow(app_stops_r) > 0 && nrow(sys_stops_r) > 0) {
+    merged_stops <- merge(
+      app_stops_r,
+      sys_stops_r,
+      by.x = c("Route", "ServiceDate", "app_stopID"),
+      by.y = c("Route", "ServiceDate", "Mapped_StopId"),
+      allow.cartesian = TRUE
+    )
+
+    if (nrow(merged_stops) > 0) {
+      candidate_keys <- unique(cand[, c("Route", "ServiceDate", "AppID", "SystemID"), with = FALSE])
+      merged_stops <- merge(merged_stops, candidate_keys,
+                            by = c("Route", "ServiceDate", "AppID", "SystemID"))
+      if (nrow(merged_stops) > 0) {
+        merged_stops[, time_diff := abs(App_StopTime_Median - Sys_StopTime_Median)]
+        stop_eval <- merged_stops[
+          , .(
+            Max_Stop_Diff = max(time_diff, na.rm = TRUE),
+            Ratio_Within_2Min = mean(time_diff <= TOLERANCE_SEC, na.rm = TRUE),
+            Common_Stops = .N
+          ),
+          by = .(Route, ServiceDate, AppID, SystemID)
+        ]
+      }
+    }
+  }
+
+  if (is.null(stop_eval) || nrow(stop_eval) == 0) {
+    cand[, Max_Stop_Diff := NA_real_]
+    cand[, Ratio_Within_2Min := 0]
+    cand[, Common_Stops := 0L]
+  } else {
+    cand <- merge(cand, stop_eval,
+                  by = c("Route", "ServiceDate", "AppID", "SystemID"), all.x = TRUE)
+    cand[is.na(Max_Stop_Diff), Max_Stop_Diff := NA_real_]
+    cand[is.na(Ratio_Within_2Min), Ratio_Within_2Min := 0]
+    cand[is.na(Common_Stops), Common_Stops := 0L]
+  }
+
+  valid_candidates <- cand[
+    !is.na(Max_Stop_Diff) & Max_Stop_Diff <= MAX_HEADWAY_SEC & Common_Stops > 0
+  ]
+
+  if (nrow(valid_candidates) == 0) {
+    setorder(cand, AppID, -IoU)
+    best_matches <- cand[, .SD[1], by = AppID]
+  } else {
+    setorder(valid_candidates, AppID, -Ratio_Within_2Min, -IoU)
+    best_matches <- valid_candidates[, .SD[1], by = AppID]
+  }
+
+  best_matches[, Level_of_Confidence :=
+                 mapply(determine_confidence, Ratio_Within_2Min, IoU, Containment)]
+  best_matches[, App_Start_Time := format_seconds(App_Start_Sec)]
+  best_matches[, App_End_Time   := format_seconds(App_End_Sec)]
+  best_matches[, Sys_Start_Time := format_seconds(Sys_Start_Sec)]
+  best_matches[, Sys_End_Time   := format_seconds(Sys_End_Sec)]
+
+  best_matches[]
+}
+
+route_day_keys <- unique(app_profile_daily[, c("Route", "ServiceDate"), with = FALSE])
+route_day_keys <- merge(route_day_keys,
+                        unique(sys_profile_daily[, c("Route", "ServiceDate"), with = FALSE]),
+                        by = c("Route", "ServiceDate"))
+setorder(route_day_keys, Route, ServiceDate)
+
+all_matches_list <- vector("list", nrow(route_day_keys))
+for (i in seq_len(nrow(route_day_keys))) {
+  all_matches_list[[i]] <- match_one_route_day(
+    route_val = route_day_keys$Route[i],
+    date_val = route_day_keys$ServiceDate[i],
+    app_profile_daily = app_profile_daily,
+    sys_profile_daily = sys_profile_daily,
+    app_stop_profile_daily = app_stop_profile_daily,
+    sys_stop_profile_daily = sys_stop_profile_daily
+  )
+}
+
+matched_trips_daily <- rbindlist(all_matches_list, use.names = TRUE, fill = TRUE)
+
+final_cols <- c(
+  "Route", "ServiceDate", "AppID", "Number_of_Riders", "SystemID",
+  "Level_of_Confidence",
+  "IoU", "Containment",
+  "Ratio_Within_2Min", "Max_Stop_Diff", "Common_Stops",
+  "App_Start_Time", "App_End_Time", "Sys_Start_Time", "Sys_End_Time",
+  "App_Start_Sec", "App_End_Sec", "Sys_Start_Sec", "Sys_End_Sec"
+)
+matched_trips_daily <- matched_trips_daily[, ..final_cols]
+setorder(matched_trips_daily, Route, ServiceDate, AppID)
+
+fwrite(matched_trips_daily, file = daily_match_file)
+cat("Saved daily match file:\n", daily_match_file, "\n")
+cat("Matched trip occurrences:", nrow(matched_trips_daily), "\n")
+
+# Cleanup objects not needed after Step 2 daily
+rm(rid_raw, sys_raw, rid_apr_clean, sys_apr_clean,
+   app_profile_daily, app_stop_profile_daily,
+   sys_profile_daily, sys_stop_profile_daily,
+   route_day_keys, all_matches_list)
+gc()
+```
+
+# Step 2.2. Monthly 1-to-1 bridge
+
+```{r step22-monthly-bridge}
+match_daily <- fread(file = daily_match_file)
+
+match_daily[, confidence_score := fifelse(
+  Level_of_Confidence == "Highly Confident (Stop-Validated)", 4,
+  fifelse(Level_of_Confidence == "Highly Confident", 3,
+          fifelse(Level_of_Confidence == "Confident", 2, 1))
+)]
+
+pair_summary <- match_daily[
+  , .(
+    matched_days = .N,
+    total_riders_month = sum(Number_of_Riders, na.rm = TRUE),
+    avg_riders_per_matched_day = mean(Number_of_Riders, na.rm = TRUE),
+    mean_iou = mean(IoU, na.rm = TRUE),
+    mean_containment = mean(Containment, na.rm = TRUE),
+    mean_ratio_2min = mean(Ratio_Within_2Min, na.rm = TRUE),
+    mean_common_stops = mean(Common_Stops, na.rm = TRUE),
+    mean_confidence_score = mean(confidence_score, na.rm = TRUE)
+  ),
+  by = .(Route, AppID, SystemID)
+]
+
+app_summary <- match_daily[
+  , .(
+    app_days_observed = uniqueN(ServiceDate),
+    total_riders_month_app = sum(Number_of_Riders, na.rm = TRUE)
+  ),
+  by = .(Route, AppID)
+]
+
+system_variety <- pair_summary[
+  , .(unique_system_ids_seen = uniqueN(SystemID)),
+  by = .(Route, AppID)
+]
+
+setorder(pair_summary, Route, AppID,
+         -matched_days, -mean_confidence_score, -mean_iou, -mean_ratio_2min)
+monthly_bridge <- pair_summary[, .SD[1], by = .(Route, AppID)]
+monthly_bridge <- merge(monthly_bridge, app_summary, by = c("Route", "AppID"), all.x = TRUE)
+monthly_bridge <- merge(monthly_bridge, system_variety, by = c("Route", "AppID"), all.x = TRUE)
+monthly_bridge[, dominant_share := matched_days / app_days_observed]
+monthly_bridge[, Monthly_Match_Stability := fifelse(
+  dominant_share >= 0.8 & unique_system_ids_seen == 1, "Very Stable",
+  fifelse(dominant_share >= 0.6, "Mostly Stable",
+          fifelse(dominant_share >= 0.4, "Mixed", "Unstable"))
+)]
+
+setcolorder(monthly_bridge, c(
+  "Route", "AppID", "SystemID",
+  "app_days_observed", "matched_days", "dominant_share",
+  "unique_system_ids_seen", "Monthly_Match_Stability",
+  "total_riders_month", "avg_riders_per_matched_day",
+  "mean_iou", "mean_containment", "mean_ratio_2min",
+  "mean_common_stops", "mean_confidence_score",
+  "total_riders_month_app"
+))
+setorder(monthly_bridge, Route, AppID)
+
+fwrite(monthly_bridge, file = monthly_bridge_file)
+cat("Saved monthly 1-to-1 bridge file:\n", monthly_bridge_file, "\n")
+
+rm(match_daily, pair_summary, app_summary, system_variety)
+gc()
+```
+
+# Step 3. OTP summary and key rankings
+
+```{r step3-otp-and-rankings}
+matched_daily <- fread(file = daily_match_file)
+sys_clean <- fread(file = mapped_avl_file)
+monthly_bridge <- fread(file = monthly_bridge_file)
+
+matched_daily[, ServiceDate := as.Date(ServiceDate)]
+sys_clean[, ServiceDate := as.Date(ServiceDate)]
+
+# Rebuild the clean AVL subset used for OTP
+setnames(
+  sys_clean,
+  old = c("RouteId", "IncidentDateTime", "Deviation"),
+  new = c("Route", "SystemTime", "Deviation"),
+  skip_absent = TRUE
+)
+
+sys_clean[, Route := as.integer(Route)]
+sys_clean[, SystemID := as.integer(SystemID)]
+sys_clean[, Mapped_StopId := as.integer(Mapped_StopId)]
+sys_clean[, Deviation := as.numeric(Deviation)]
+
+sys_clean <- sys_clean[
+  format(ServiceDate, "%Y-%m") == "2024-04" &
+    mapping_flag %in% KEEP_MAPPING_FLAGS &
+    !is.na(Mapped_StopId)
+]
+
+# Trip occurrence OTP
+sys_clean[, on_time_point := as.integer(abs(Deviation) <= OTP_THRESHOLD_MIN)]
+
+trip_occurrence <- sys_clean[
+  ,
+  .(
+    trip_otp = as.numeric(mean(on_time_point, na.rm = TRUE)),
+    mean_abs_deviation = as.numeric(mean(abs(Deviation), na.rm = TRUE)),
+    median_abs_deviation = as.numeric(median(abs(Deviation), na.rm = TRUE)),
+    n_timepoints = as.integer(.N)
+  ),
+  by = .(Route, ServiceDate, SystemID)
+]
+
+trip_occurrence[, trip_on_time := as.integer(trip_otp >= 0.5)]
+
+matched_otp <- merge(
+  matched_daily,
+  trip_occurrence,
+  by = c("Route", "ServiceDate", "SystemID"),
+  all.x = TRUE
+)
+
+matched_otp <- matched_otp[!is.na(trip_on_time)]
+
+# 3.1 Route-level OTP summary
+route_summary <- matched_otp[
+  ,
+  .(
+    matched_trip_occurrences = as.integer(.N),
+    total_riders = as.numeric(sum(Number_of_Riders, na.rm = TRUE)),
+    avg_riders_per_occurrence = as.numeric(mean(Number_of_Riders, na.rm = TRUE)),
+    OTP = as.numeric(mean(trip_on_time, na.rm = TRUE)),
+    Weighted_OTP = as.numeric(
+      sum(Number_of_Riders * trip_on_time, na.rm = TRUE) /
+        sum(Number_of_Riders, na.rm = TRUE)
+    ),
+    mean_trip_otp = as.numeric(mean(trip_otp, na.rm = TRUE)),
+    weighted_mean_trip_otp = as.numeric(
+      sum(Number_of_Riders * trip_otp, na.rm = TRUE) /
+        sum(Number_of_Riders, na.rm = TRUE)
+    )
+  ),
+  by = Route
+]
+
+route_summary[, OTP_pct := 100 * OTP]
+route_summary[, Weighted_OTP_pct := 100 * Weighted_OTP]
+route_summary[, mean_trip_otp_pct := 100 * mean_trip_otp]
+route_summary[, weighted_mean_trip_otp_pct := 100 * weighted_mean_trip_otp]
+
+setorder(route_summary, Route)
+fwrite(route_summary, file = route_summary_file)
+
+p <- ggplot(route_summary, aes(x = OTP, y = Weighted_OTP, size = total_riders, label = Route)) +
+  geom_point(alpha = 0.7) +
+  geom_text(nudge_y = 0.01, size = 3) +
+  labs(
+    title = "OTP vs Weighted OTP by Route (April 2024)",
+    x = "OTP",
+    y = "Weighted OTP",
+    size = "Total Riders"
+  ) +
+  theme_minimal()
+
+ggsave(filename = scatter_plot_file, plot = p, width = 8, height = 6, dpi = 300)
+
+# 3.2 Trip-level rankings
+trip_daily <- merge(
+  matched_daily,
+  trip_occurrence,
+  by = c("Route", "ServiceDate", "SystemID"),
+  all.x = TRUE
+)
+
+trip_daily <- trip_daily[!is.na(trip_on_time)]
+
+trip_summary <- trip_daily[
+  ,
+  .(
+    matched_days = as.integer(uniqueN(ServiceDate)),
+    total_riders_month = as.numeric(sum(Number_of_Riders, na.rm = TRUE)),
+    avg_riders_per_day = as.numeric(mean(Number_of_Riders, na.rm = TRUE)),
+    late_day_rate = as.numeric(mean(trip_on_time == 0, na.rm = TRUE)),
+    on_time_day_rate = as.numeric(mean(trip_on_time == 1, na.rm = TRUE)),
+    mean_trip_otp = as.numeric(mean(trip_otp, na.rm = TRUE)),
+    mean_abs_deviation = as.numeric(mean(mean_abs_deviation, na.rm = TRUE))
+  ),
+  by = .(Route, AppID)
+]
+
+# only keep non-conflicting monthly bridge columns
+monthly_bridge_keep <- monthly_bridge[
+  ,
+  .(
+    Route,
+    AppID,
+    SystemID,
+    Monthly_Match_Stability,
+    dominant_share
+  )
+]
+
+trip_summary <- merge(
+  trip_summary,
+  monthly_bridge_keep,
+  by = c("Route", "AppID"),
+  all.x = TRUE
+)
+
+trip_summary[, late_day_rate_pct := 100 * late_day_rate]
+trip_summary[, mean_trip_otp_pct := 100 * mean_trip_otp]
+
+trip_summary_rankable <- trip_summary[matched_days >= MIN_DAYS_FOR_RANKING]
+
+top_late <- trip_summary_rankable[
+  order(-late_day_rate, mean_trip_otp, -matched_days, -total_riders_month)
+][1:min(20, .N)]
+top_late[, ranking_type := "Most Often Late"]
+
+top_ridership <- trip_summary[
+  order(-total_riders_month, -avg_riders_per_day, -matched_days)
+][1:min(20, .N)]
+top_ridership[, ranking_type := "Highest Ridership"]
+
+top_reliability <- trip_summary_rankable[
+  order(mean_trip_otp, -late_day_rate, -matched_days, -total_riders_month)
+][1:min(20, .N)]
+top_reliability[, ranking_type := "Worst Reliability"]
+
+trip_rankings <- rbindlist(
+  list(top_late, top_ridership, top_reliability),
+  use.names = TRUE,
+  fill = TRUE
+)
+
+wanted_cols <- c(
+  "ranking_type", "Route", "AppID", "SystemID", "matched_days",
+  "total_riders_month", "avg_riders_per_day",
+  "late_day_rate_pct", "mean_trip_otp_pct",
+  "Monthly_Match_Stability", "dominant_share"
+)
+
+setcolorder(trip_rankings, wanted_cols[wanted_cols %in% names(trip_rankings)])
+
+fwrite(trip_rankings, file = trip_rankings_file)
+
+# Final concise output messages
+cat("Saved route summary file:\n", route_summary_file, "\n")
+cat("Saved scatter plot:\n", scatter_plot_file, "\n")
+cat("Saved trip rankings file:\n", trip_rankings_file, "\n")
+
+print(route_summary[1:10])
+print(trip_rankings[, .N, by = ranking_type])
+
+# Cleanup after Step 3
+rm(
+  sys_clean, trip_occurrence, matched_otp, p,
+  trip_daily, trip_summary, trip_summary_rankable,
+  top_late, top_ridership, top_reliability,
+  monthly_bridge_keep
+)
+gc()
+```
