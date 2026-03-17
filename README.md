@@ -1,5 +1,3 @@
-
-```markdown
 # RIPTA Transit Reliability & Ridership Analysis
 
 This repository contains a full data pipeline for integrating RIPTA AVL data, GTFS schedules, and ridership data to analyze transit reliability and passenger demand.
@@ -270,4 +268,4 @@ RIPTA Transit Data Analysis Project
 Brown University collaboration
 Under guidance of Prof. Alice Paul
 
-````
+
